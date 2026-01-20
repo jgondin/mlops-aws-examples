@@ -1,0 +1,296 @@
+name: Deploy XGBoost Model
+
+# Workflow triggers
+on:
+  # Manual trigger with inputs
+  workflow_dispatch:
+    inputs:
+      model_path:
+        description: 'S3 path to model artifacts (model.tar.gz)'
+        required: true
+      job_name:
+        description: 'Training job name'
+        required: true
+      f1_score:
+        description: 'Model F1-score'
+        required: false
+
+  # Triggered by successful training workflow
+  workflow_call:
+    inputs:
+      model_path:
+        required: true
+        type: string
+      job_name:
+        required: true
+        type: string
+      f1_score:
+        required: false
+        type: string
+
+# Environment variables
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
+  PYTHON_VERSION: '3.9'
+
+jobs:
+  deploy:
+    name: Deploy Model for Inference
+    runs-on: ubuntu-latest
+
+    # Set permissions for OIDC authentication
+    permissions:
+      id-token: write
+      contents: read
+      deployments: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r xgboost-pipeline/requirements.txt
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-Deploy
+
+      - name: Verify AWS credentials
+        run: |
+          aws sts get-caller-identity
+          echo "AWS Region: $AWS_REGION"
+
+      - name: Get Model Path
+        id: model
+        run: |
+          MODEL_PATH="${{ github.event.inputs.model_path || inputs.model_path }}"
+          echo "model_path=$MODEL_PATH" >> $GITHUB_OUTPUT
+          echo "Model path: $MODEL_PATH"
+
+      - name: Register Model in S3
+        id: register
+        run: |
+          MODEL_PATH="${{ steps.model.outputs.model_path }}"
+          JOB_NAME="${{ github.event.inputs.job_name || inputs.job_name }}"
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+
+          # Create model registry entry in S3
+          REGISTRY_PATH="s3://${{ secrets.MODELS_BUCKET }}/model-registry/${JOB_NAME}"
+
+          # Create metadata file
+          cat > model_metadata.json <<EOF
+          {
+            "model_path": "$MODEL_PATH",
+            "job_name": "$JOB_NAME",
+            "f1_score": "${{ github.event.inputs.f1_score || inputs.f1_score }}",
+            "deployment_timestamp": "$TIMESTAMP",
+            "deployed_by": "${{ github.actor }}",
+            "commit_sha": "${{ github.sha }}",
+            "status": "deployed"
+          }
+          EOF
+
+          # Upload metadata
+          aws s3 cp model_metadata.json ${REGISTRY_PATH}/metadata.json --region ${{ env.AWS_REGION }}
+
+          echo "Model registered at: ${REGISTRY_PATH}"
+          echo "registry_path=$REGISTRY_PATH" >> $GITHUB_OUTPUT
+
+      - name: Get XGBoost Container Image
+        id: container
+        run: |
+          # Get XGBoost container image URI
+          IMAGE_URI=$(python -c "
+          import sagemaker
+          image = sagemaker.image_uris.retrieve(
+              framework='xgboost',
+              region='${{ env.AWS_REGION }}',
+              version='1.5-1',
+              image_scope='inference'
+          )
+          print(image)
+          ")
+
+          echo "image_uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+          echo "Container image: $IMAGE_URI"
+
+      - name: Prepare Test Data for Inference
+        id: test_data
+        run: |
+          # For this deployment, we'll run inference on the test dataset
+          # In production, you'd use new/production data
+
+          TEST_DATA_PATH="s3://${{ secrets.FEATURES_BUCKET }}/processed-data/test_xgb.csv"
+
+          echo "test_data=$TEST_DATA_PATH" >> $GITHUB_OUTPUT
+          echo "Test data path: $TEST_DATA_PATH"
+
+      - name: Run Batch Inference
+        id: inference
+        run: |
+          echo "::group::Batch Inference Pipeline"
+          cd xgboost-pipeline
+
+          # Set output path
+          OUTPUT_PATH="s3://${{ secrets.PREDICTIONS_BUCKET }}/predictions/$(date +%Y%m%d-%H%M%S)"
+
+          # Run inference pipeline
+          python src/inference_pipeline.py \
+            --model-path ${{ steps.model.outputs.model_path }} \
+            --input-data ${{ steps.test_data.outputs.test_data }} \
+            --output-path $OUTPUT_PATH \
+            --role-arn ${{ secrets.SAGEMAKER_ROLE_ARN }} \
+            --image-uri ${{ steps.container.outputs.image_uri }} \
+            --region ${{ env.AWS_REGION }} \
+            --instance-type ml.m5.large \
+            > inference_output.txt
+
+          echo "::endgroup::"
+
+          # Parse output
+          TRANSFORM_JOB=$(grep "Transform Job:" inference_output.txt | awk '{print $3}')
+
+          echo "transform_job=$TRANSFORM_JOB" >> $GITHUB_OUTPUT
+          echo "output_path=$OUTPUT_PATH" >> $GITHUB_OUTPUT
+
+          cat inference_output.txt
+
+      - name: Wait for Batch Transform Completion
+        run: |
+          echo "Transform job: ${{ steps.inference.outputs.transform_job }}"
+          echo "Waiting for SageMaker batch transform job to complete..."
+
+          # Poll transform job status
+          MAX_WAIT=1800  # 30 minutes
+          ELAPSED=0
+          INTERVAL=30
+
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            STATUS=$(aws sagemaker describe-transform-job \
+              --transform-job-name ${{ steps.inference.outputs.transform_job }} \
+              --region ${{ env.AWS_REGION }} \
+              --query 'TransformJobStatus' \
+              --output text)
+
+            echo "Current status: $STATUS (elapsed: ${ELAPSED}s)"
+
+            if [ "$STATUS" == "Completed" ]; then
+              echo "✅ Batch transform completed successfully!"
+              break
+            elif [ "$STATUS" == "Failed" ] || [ "$STATUS" == "Stopped" ]; then
+              echo "❌ Batch transform job failed or stopped!"
+              exit 1
+            fi
+
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
+
+          if [ $ELAPSED -ge $MAX_WAIT ]; then
+            echo "❌ Batch transform job timeout!"
+            exit 1
+          fi
+
+      - name: Validate Predictions Output
+        id: validate
+        run: |
+          echo "::group::Validation"
+
+          OUTPUT_PATH="${{ steps.inference.outputs.output_path }}"
+
+          # List files in output path
+          aws s3 ls $OUTPUT_PATH/ --region ${{ env.AWS_REGION }} --recursive
+
+          # Count prediction files
+          NUM_FILES=$(aws s3 ls $OUTPUT_PATH/ --region ${{ env.AWS_REGION }} --recursive | wc -l)
+
+          echo "Number of prediction files: $NUM_FILES"
+
+          if [ $NUM_FILES -eq 0 ]; then
+            echo "❌ No prediction files found!"
+            exit 1
+          fi
+
+          # Download first prediction file for validation
+          FIRST_FILE=$(aws s3 ls $OUTPUT_PATH/ --region ${{ env.AWS_REGION }} --recursive | head -1 | awk '{print $4}')
+          aws s3 cp s3://${{ secrets.PREDICTIONS_BUCKET }}/$FIRST_FILE predictions_sample.csv --region ${{ env.AWS_REGION }}
+
+          # Show sample predictions
+          echo "Sample predictions:"
+          head -10 predictions_sample.csv
+
+          # Count predictions
+          NUM_PREDICTIONS=$(wc -l < predictions_sample.csv)
+          echo "Number of predictions: $NUM_PREDICTIONS"
+
+          echo "num_predictions=$NUM_PREDICTIONS" >> $GITHUB_OUTPUT
+
+          echo "::endgroup::"
+
+      - name: Update Deployment Status
+        if: success()
+        uses: chrnorm/deployment-status@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          state: success
+          deployment-id: ${{ steps.deployment.outputs.deployment_id }}
+          description: 'Batch inference completed successfully'
+
+      - name: Upload Deployment Artifacts
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: deployment-artifacts
+          path: |
+            xgboost-pipeline/inference_output.txt
+            model_metadata.json
+            predictions_sample.csv
+          retention-days: 30
+
+      - name: Post Deployment Summary
+        if: always()
+        run: |
+          echo "## Deployment Pipeline Summary 🚀" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Model Path | ${{ steps.model.outputs.model_path }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Transform Job | ${{ steps.inference.outputs.transform_job }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Output Path | ${{ steps.inference.outputs.output_path }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Predictions | ${{ steps.validate.outputs.num_predictions }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | ${{ job.status }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Model deployed and batch inference completed successfully!" >> $GITHUB_STEP_SUMMARY
+
+      - name: Create Release Tag
+        if: success()
+        run: |
+          # Create a git tag for this deployment
+          JOB_NAME="${{ github.event.inputs.job_name || inputs.job_name }}"
+          TAG_NAME="deploy-${JOB_NAME}"
+
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+          # Note: This requires write permissions
+          # git tag -a $TAG_NAME -m "Deployment of model from $JOB_NAME"
+          # git push origin $TAG_NAME
+
+          echo "Would create tag: $TAG_NAME"
+
+      - name: Notify on Failure
+        if: failure()
+        run: |
+          echo "❌ Deployment failed! Check the logs for details."
+          # In production, you might want to send notifications via SNS, Slack, etc.

@@ -1,0 +1,257 @@
+name: Train XGBoost Model
+
+# Workflow triggers
+on:
+  # Manual trigger
+  workflow_dispatch:
+    inputs:
+      test_size:
+        description: 'Test data split ratio'
+        required: false
+        default: '0.2'
+
+  # Scheduled trigger (weekly)
+  schedule:
+    - cron: '0 2 * * 1'  # Every Monday at 2 AM UTC
+
+  # Webhook trigger from EventBridge (via repository_dispatch)
+  repository_dispatch:
+    types: [scheduled-retraining]
+
+# Environment variables
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
+  PYTHON_VERSION: '3.9'
+
+jobs:
+  train:
+    name: Train and Evaluate Model
+    runs-on: ubuntu-latest
+
+    # Set permissions for OIDC authentication
+    permissions:
+      id-token: write
+      contents: read
+
+    outputs:
+      f1_score: ${{ steps.evaluate.outputs.f1_score }}
+      model_path: ${{ steps.evaluate.outputs.model_path }}
+      job_name: ${{ steps.evaluate.outputs.job_name }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r xgboost-pipeline/requirements.txt
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-Train
+
+      - name: Verify AWS credentials
+        run: |
+          aws sts get-caller-identity
+          echo "AWS Region: $AWS_REGION"
+
+      - name: Run Feature Pipeline
+        id: features
+        run: |
+          echo "::group::Feature Pipeline"
+          cd xgboost-pipeline
+
+          python src/feature_pipeline.py \
+            --s3-bucket ${{ secrets.FEATURES_BUCKET }} \
+            --s3-prefix processed-data \
+            --test-size ${{ github.event.inputs.test_size || '0.2' }}
+
+          echo "::endgroup::"
+
+          # Export paths for next steps
+          echo "train_data=s3://${{ secrets.FEATURES_BUCKET }}/processed-data/train.csv" >> $GITHUB_OUTPUT
+          echo "test_data=s3://${{ secrets.FEATURES_BUCKET }}/processed-data/test.csv" >> $GITHUB_OUTPUT
+
+      - name: Run Training Pipeline
+        id: training
+        run: |
+          echo "::group::Training Pipeline"
+          cd xgboost-pipeline
+
+          # Run training
+          python src/training_pipeline.py \
+            --s3-bucket ${{ secrets.MODELS_BUCKET }} \
+            --role-arn ${{ secrets.SAGEMAKER_ROLE_ARN }} \
+            --train-data ${{ steps.features.outputs.train_data }} \
+            --test-data ${{ steps.features.outputs.test_data }} \
+            --region ${{ env.AWS_REGION }} \
+            --max-depth 5 \
+            --eta 0.2 \
+            --num-round 100 \
+            > training_output.txt
+
+          echo "::endgroup::"
+
+          # Parse output to get job name and model path
+          JOB_NAME=$(grep "Training Job:" training_output.txt | awk '{print $3}')
+          MODEL_PATH=$(grep "Model Path:" training_output.txt | awk '{print $3}')
+
+          echo "job_name=$JOB_NAME" >> $GITHUB_OUTPUT
+          echo "model_path=$MODEL_PATH" >> $GITHUB_OUTPUT
+
+          cat training_output.txt
+
+      - name: Wait for Training Completion
+        run: |
+          echo "Training job: ${{ steps.training.outputs.job_name }}"
+          echo "Waiting for SageMaker training job to complete..."
+
+          # Poll training job status
+          MAX_WAIT=3600  # 1 hour
+          ELAPSED=0
+          INTERVAL=30
+
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            STATUS=$(aws sagemaker describe-training-job \
+              --training-job-name ${{ steps.training.outputs.job_name }} \
+              --region ${{ env.AWS_REGION }} \
+              --query 'TrainingJobStatus' \
+              --output text)
+
+            echo "Current status: $STATUS (elapsed: ${ELAPSED}s)"
+
+            if [ "$STATUS" == "Completed" ]; then
+              echo "✅ Training completed successfully!"
+              break
+            elif [ "$STATUS" == "Failed" ] || [ "$STATUS" == "Stopped" ]; then
+              echo "❌ Training job failed or stopped!"
+              exit 1
+            fi
+
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
+
+          if [ $ELAPSED -ge $MAX_WAIT ]; then
+            echo "❌ Training job timeout!"
+            exit 1
+          fi
+
+      - name: Evaluate Model Performance
+        id: evaluate
+        run: |
+          echo "::group::Model Evaluation"
+
+          # Get metrics from S3
+          JOB_NAME=${{ steps.training.outputs.job_name }}
+          METRICS_PATH="s3://${{ secrets.MODELS_BUCKET }}/model-artifacts/${JOB_NAME}/metrics.json"
+
+          # Download metrics
+          aws s3 cp $METRICS_PATH metrics.json --region ${{ env.AWS_REGION }}
+
+          # Parse F1-score
+          F1_SCORE=$(python -c "import json; data=json.load(open('metrics.json')); print(data['f1_score'])")
+          ACCURACY=$(python -c "import json; data=json.load(open('metrics.json')); print(data['accuracy'])")
+
+          echo "F1-Score: $F1_SCORE"
+          echo "Accuracy: $ACCURACY"
+
+          # Export for next job
+          echo "f1_score=$F1_SCORE" >> $GITHUB_OUTPUT
+          echo "model_path=${{ steps.training.outputs.model_path }}" >> $GITHUB_OUTPUT
+          echo "job_name=$JOB_NAME" >> $GITHUB_OUTPUT
+
+          # Display full metrics
+          echo "Full Metrics:"
+          cat metrics.json | python -m json.tool
+
+          echo "::endgroup::"
+
+      - name: Check F1-Score Threshold
+        run: |
+          F1_SCORE=${{ steps.evaluate.outputs.f1_score }}
+          THRESHOLD=0.75
+
+          echo "F1-Score: $F1_SCORE"
+          echo "Threshold: $THRESHOLD"
+
+          # Compare F1-score (using Python for float comparison)
+          PASS=$(python -c "print('true' if float('$F1_SCORE') > $THRESHOLD else 'false')")
+
+          if [ "$PASS" == "true" ]; then
+            echo "✅ F1-score ($F1_SCORE) exceeds threshold ($THRESHOLD)"
+            echo "Model approved for deployment!"
+          else
+            echo "❌ F1-score ($F1_SCORE) below threshold ($THRESHOLD)"
+            echo "Model does not meet quality requirements"
+            exit 1
+          fi
+
+      - name: Create GitHub Deployment
+        if: success()
+        uses: chrnorm/deployment-action@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          environment: production
+          description: 'Deploy XGBoost model'
+
+      - name: Upload Training Artifacts
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: training-artifacts
+          path: |
+            xgboost-pipeline/training_output.txt
+            metrics.json
+          retention-days: 30
+
+      - name: Post Training Summary
+        if: always()
+        run: |
+          echo "## Training Pipeline Summary 🚀" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Training Job | ${{ steps.evaluate.outputs.job_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| F1-Score | ${{ steps.evaluate.outputs.f1_score }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Model Path | ${{ steps.evaluate.outputs.model_path }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | ${{ job.status }} |" >> $GITHUB_STEP_SUMMARY
+
+  deploy:
+    name: Trigger Deployment
+    needs: train
+    if: success()
+    runs-on: ubuntu-latest
+
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - name: Trigger Deploy Workflow
+        uses: actions/github-script@v6
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'deploy.yml',
+              ref: context.ref,
+              inputs: {
+                model_path: '${{ needs.train.outputs.model_path }}',
+                job_name: '${{ needs.train.outputs.job_name }}',
+                f1_score: '${{ needs.train.outputs.f1_score }}'
+              }
+            });
+
+            console.log('✅ Deployment workflow triggered successfully!');
