@@ -1,0 +1,330 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'MLOps Infrastructure for SageMaker - Training, Deployment, and Monitoring'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: mlops-demo
+    Description: Project name for resource naming
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for CloudWatch alarm notifications
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+
+Resources:
+  # S3 Bucket for ML artifacts
+  MLArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-ml-artifacts-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+          - Id: MoveToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: STANDARD_IA
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for SageMaker Execution
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-sagemaker-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - sagemaker.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonSageMakerFullAccess'
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:DeleteObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !GetAtt MLArtifactsBucket.Arn
+                  - !Sub '${MLArtifactsBucket.Arn}/*'
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SNS Topic for Alarms
+  MLOpsAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-mlops-alarms'
+      DisplayName: MLOps Monitoring Alarms
+      Subscription:
+        - Endpoint: !Ref NotificationEmail
+          Protocol: email
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Log Group for SageMaker
+  SageMakerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/sagemaker/${ProjectName}-${Environment}'
+      RetentionInDays: 30
+
+  # Model Registry (via SageMaker Model Package Group)
+  ModelPackageGroup:
+    Type: AWS::SageMaker::ModelPackageGroup
+    Properties:
+      ModelPackageGroupName: !Sub '${ProjectName}-${Environment}-models'
+      ModelPackageGroupDescription: !Sub 'Model registry for ${ProjectName} ${Environment}'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Function for Model Monitoring
+  ModelMonitoringFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-model-monitor'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref MLArtifactsBucket
+          SNS_TOPIC_ARN: !Ref MLOpsAlarmTopic
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime, timedelta
+
+          sagemaker = boto3.client('sagemaker')
+          cloudwatch = boto3.client('cloudwatch')
+          sns = boto3.client('sns')
+
+          def lambda_handler(event, context):
+              """Monitor SageMaker endpoints for drift and performance."""
+
+              endpoint_name = event.get('endpoint_name')
+              if not endpoint_name:
+                  return {'statusCode': 400, 'body': 'Missing endpoint_name'}
+
+              try:
+                  # Get endpoint metrics
+                  metrics = get_endpoint_metrics(endpoint_name)
+
+                  # Check for anomalies
+                  anomalies = detect_anomalies(metrics)
+
+                  if anomalies:
+                      send_alert(endpoint_name, anomalies)
+
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'endpoint': endpoint_name,
+                          'metrics': metrics,
+                          'anomalies': anomalies
+                      })
+                  }
+              except Exception as e:
+                  print(f"Error: {e}")
+                  return {'statusCode': 500, 'body': str(e)}
+
+          def get_endpoint_metrics(endpoint_name):
+              """Fetch CloudWatch metrics for endpoint."""
+              end_time = datetime.utcnow()
+              start_time = end_time - timedelta(hours=1)
+
+              metrics = {}
+              metric_names = ['Invocations', 'ModelLatency', 'ModelInvocationErrors']
+
+              for metric_name in metric_names:
+                  response = cloudwatch.get_metric_statistics(
+                      Namespace='AWS/SageMaker',
+                      MetricName=metric_name,
+                      Dimensions=[
+                          {'Name': 'EndpointName', 'Value': endpoint_name},
+                          {'Name': 'VariantName', 'Value': 'AllTraffic'}
+                      ],
+                      StartTime=start_time,
+                      EndTime=end_time,
+                      Period=300,
+                      Statistics=['Average', 'Sum']
+                  )
+                  metrics[metric_name] = response['Datapoints']
+
+              return metrics
+
+          def detect_anomalies(metrics):
+              """Simple anomaly detection on metrics."""
+              anomalies = []
+
+              # Check error rate
+              errors = metrics.get('ModelInvocationErrors', [])
+              if errors and any(dp['Sum'] > 10 for dp in errors):
+                  anomalies.append('High error rate detected')
+
+              # Check latency
+              latency = metrics.get('ModelLatency', [])
+              if latency and any(dp['Average'] > 5000 for dp in latency):
+                  anomalies.append('High latency detected')
+
+              return anomalies
+
+          def send_alert(endpoint_name, anomalies):
+              """Send SNS notification for anomalies."""
+              message = f"Anomalies detected for endpoint {endpoint_name}:\n\n"
+              message += "\n".join(f"- {a}" for a in anomalies)
+
+              sns.publish(
+                  TopicArn=os.environ['SNS_TOPIC_ARN'],
+                  Subject=f'MLOps Alert: {endpoint_name}',
+                  Message=message
+              )
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for Lambda
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: SageMakerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sagemaker:DescribeEndpoint'
+                  - 'sagemaker:DescribeEndpointConfig'
+                  - 'cloudwatch:GetMetricStatistics'
+                  - 'cloudwatch:PutMetricData'
+                Resource: '*'
+        - PolicyName: SNSPublish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'sns:Publish'
+                Resource: !Ref MLOpsAlarmTopic
+
+  # EventBridge Rule for scheduled monitoring
+  ModelMonitoringSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-monitoring-schedule'
+      Description: Trigger model monitoring every 15 minutes
+      ScheduleExpression: 'rate(15 minutes)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ModelMonitoringFunction.Arn
+          Id: ModelMonitoringTarget
+
+  # Permission for EventBridge to invoke Lambda
+  MonitoringLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ModelMonitoringFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ModelMonitoringSchedule.Arn
+
+Outputs:
+  ArtifactsBucketName:
+    Description: S3 bucket for ML artifacts
+    Value: !Ref MLArtifactsBucket
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-artifacts-bucket'
+
+  SageMakerRoleArn:
+    Description: IAM role ARN for SageMaker execution
+    Value: !GetAtt SageMakerExecutionRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-sagemaker-role'
+
+  AlarmTopicArn:
+    Description: SNS topic ARN for monitoring alarms
+    Value: !Ref MLOpsAlarmTopic
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-alarm-topic'
+
+  ModelPackageGroupName:
+    Description: SageMaker Model Package Group name
+    Value: !Ref ModelPackageGroup
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-model-group'
+
+  MonitoringFunctionArn:
+    Description: Lambda function ARN for model monitoring
+    Value: !GetAtt ModelMonitoringFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-monitoring-function'

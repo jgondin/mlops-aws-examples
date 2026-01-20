@@ -1,0 +1,94 @@
+# SageMaker Training and Deployment Configuration
+
+# AWS Configuration
+aws:
+  region: us-east-1
+  s3_bucket: mlops-demo-artifacts  # Change to your bucket name
+  sagemaker_role: arn:aws:iam::123456789012:role/SageMakerExecutionRole  # Change to your role ARN
+
+# Training Configuration
+training:
+  instance_type: ml.m5.xlarge
+  instance_count: 1
+  max_runtime_seconds: 3600
+  volume_size_gb: 30
+
+  # Data paths
+  data:
+    train: s3://mlops-demo-artifacts/data/train
+    validation: s3://mlops-demo-artifacts/data/validation
+    test: s3://mlops-demo-artifacts/data/test
+
+  # Model output
+  model_dir: s3://mlops-demo-artifacts/models
+
+  # Hyperparameters
+  hyperparameters:
+    n_estimators: 100
+    max_depth: 10
+    min_samples_split: 5
+    min_samples_leaf: 2
+
+# Deployment Configuration
+deployment:
+  endpoint_name: churn-prediction-endpoint
+  instance_type: ml.t2.medium
+  instance_count: 1
+  initial_variant_weight: 1.0
+
+  # Auto-scaling (optional)
+  auto_scaling:
+    enabled: true
+    min_instances: 1
+    max_instances: 3
+    target_invocations_per_instance: 100
+
+  # Data capture for monitoring
+  data_capture:
+    enabled: true
+    sampling_percentage: 100
+    destination: s3://mlops-demo-artifacts/data-capture
+
+# Monitoring Configuration
+monitoring:
+  enabled: true
+  schedule_cron: "0 */6 * * *"  # Every 6 hours
+
+  # CloudWatch alarms
+  alarms:
+    high_latency:
+      threshold_ms: 5000
+      evaluation_periods: 2
+      enabled: true
+
+    high_error_rate:
+      threshold_percent: 5.0
+      evaluation_periods: 2
+      enabled: true
+
+    low_invocations:
+      threshold: 10
+      evaluation_periods: 3
+      enabled: true
+
+  # Drift detection
+  drift_detection:
+    enabled: true
+    baseline_data: s3://mlops-demo-artifacts/baselines/training_baseline.csv
+    threshold: 0.05  # p-value threshold
+
+# Model Registry
+model_registry:
+  package_group_name: churn-prediction-models
+  approval_status: PendingManualApproval  # or Approved for auto-deployment
+
+# Tags
+tags:
+  - Key: Project
+    Value: mlops-demo
+  - Key: Environment
+    Value: dev
+  - Key: Owner
+    Value: ml-team
+  - Key: CostCenter
+    Value: data-science
